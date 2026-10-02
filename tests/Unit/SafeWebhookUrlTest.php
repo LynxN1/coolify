@@ -4,6 +4,10 @@ use App\Models\InstanceSettings;
 use App\Rules\SafeWebhookUrl;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Validator;
+use PurplePixie\PhpDns\DNSAnswer;
+use PurplePixie\PhpDns\DNSQuery;
+use PurplePixie\PhpDns\DNSResult;
+use PurplePixie\PhpDns\DNSTypes;
 use Tests\TestCase;
 
 uses(TestCase::class, RefreshDatabase::class);
@@ -448,4 +452,88 @@ it('still rejects private targets after system DNS fallback when host is not all
     );
 
     expect($validator->fails())->toBeTrue('Expected private IP rejection without allowlist after fallback');
+});
+
+function fakeDnsQuery(string|false $error, array $answers = []): DNSQuery
+{
+    return new class($error, $answers) extends DNSQuery
+    {
+        public function __construct(private string|false $error, private array $answers)
+        {
+            parent::__construct('1.1.1.1', 53, 5);
+        }
+
+        public function query(string $question, string $typeName = DNSTypes::NAME_A)
+        {
+            if ($this->error !== false) {
+                return false;
+            }
+
+            $answer = new DNSAnswer;
+            foreach ($this->answers[$typeName] ?? [] as $ip) {
+                $answer->addResult(new DNSResult($typeName, 0, 'IN', 300, $ip, $question, '', []));
+            }
+
+            return $answer;
+        }
+
+        public function hasError(): bool
+        {
+            return $this->error !== false;
+        }
+
+        public function getLasterror(): string
+        {
+            return $this->error === false ? '' : $this->error;
+        }
+    };
+}
+
+it('retries custom DNS lookups over TCP when the UDP answer is truncated', function () {
+    $rule = new class extends SafeWebhookUrl
+    {
+        /** @var array<int, bool> */
+        public array $transports = [];
+
+        protected function makeDnsQuery(string $dnsServer, bool $udp): DNSQuery
+        {
+            $this->transports[] = $udp;
+            $answers = [
+                DNSTypes::NAME_A => ['172.64.66.1'],
+                DNSTypes::NAME_AAAA => ['2606:4700:113::1'],
+            ];
+
+            // Simulate 1.1.1.1 setting the TC bit on the A answer over UDP only.
+            if ($udp && count($this->transports) === 1) {
+                return fakeDnsQuery('Response too big for UDP, retry with TCP');
+            }
+
+            return fakeDnsQuery(false, $answers);
+        }
+    };
+
+    $method = new ReflectionMethod(SafeWebhookUrl::class, 'resolveHostWithCustomDnsServers');
+
+    expect($method->invoke($rule, 'bucket.r2.cloudflarestorage.com', ['1.1.1.1']))->toBe(['172.64.66.1', '2606:4700:113::1'])
+        ->and($rule->transports)->toBe([true, false, true]);
+});
+
+it('does not retry custom DNS lookups over TCP for other UDP failures', function () {
+    $rule = new class extends SafeWebhookUrl
+    {
+        /** @var array<int, bool> */
+        public array $transports = [];
+
+        protected function makeDnsQuery(string $dnsServer, bool $udp): DNSQuery
+        {
+            $this->transports[] = $udp;
+
+            return fakeDnsQuery('Failed to read data buffer');
+        }
+    };
+
+    $method = new ReflectionMethod(SafeWebhookUrl::class, 'resolveHostWithCustomDnsServers');
+
+    expect($method->invoke($rule, 'example.com', ['1.1.1.1']))->toBe([])
+        ->and($rule->transports)->toBe([true, true]);
 });

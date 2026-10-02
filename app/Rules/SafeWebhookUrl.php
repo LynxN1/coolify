@@ -362,8 +362,16 @@ class SafeWebhookUrl implements ValidationRule
         foreach ($dnsServers as $dnsServer) {
             foreach ([DNSTypes::NAME_A, DNSTypes::NAME_AAAA] as $type) {
                 try {
-                    $query = new DNSQuery($dnsServer, 53, 5);
+                    $query = $this->makeDnsQuery($dnsServer, udp: true);
                     $records = $query->query($host, $type);
+
+                    // Resolvers such as 1.1.1.1 may set the TC bit on a small UDP answer to force TCP.
+                    // Retry over TCP so this record type is not dropped, which would otherwise pin
+                    // dual-stack hosts to a single address family (e.g. IPv6 only).
+                    if ($records === false && str_contains($query->getLasterror(), 'too big for UDP')) {
+                        $query = $this->makeDnsQuery($dnsServer, udp: false);
+                        $records = $query->query($host, $type);
+                    }
 
                     if ($records === false || $query->hasError()) {
                         continue;
@@ -381,6 +389,11 @@ class SafeWebhookUrl implements ValidationRule
         }
 
         return array_values(array_unique($ips));
+    }
+
+    protected function makeDnsQuery(string $dnsServer, bool $udp): DNSQuery
+    {
+        return new DNSQuery($dnsServer, 53, 5, $udp);
     }
 
     /**
